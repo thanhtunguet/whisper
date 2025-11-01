@@ -2,9 +2,10 @@
 import argparse
 import queue
 import threading
+import sys
 import time
+from collections import deque
 from datetime import datetime
-from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import whisper
@@ -17,10 +18,16 @@ class RealtimeTranscriber:
         device: str | None = None,
         chunk_duration: float = 3.0,
         sample_rate: int = 16000,
+        refinement_history: int = 3,
     ):
         self.chunk_duration = chunk_duration
         self.sample_rate = sample_rate
         self.chunk_size = int(chunk_duration * sample_rate)
+        self.refinement_history = max(1, refinement_history)
+        self.chunk_history: deque[np.ndarray] = deque(maxlen=self.refinement_history)
+        self.last_refined_text: str = ""
+        self._live_line_active = False
+        self._live_line_length = 0
         
         # Auto-select device if not provided (prioritize MPS for M1/M2 Macs)
         if device is None:
@@ -100,6 +107,7 @@ class RealtimeTranscriber:
         if hasattr(self, 'stream'):
             self.stream.stop()
             self.stream.close()
+        self._clear_live_line()
         print("Recording stopped.")
     
     def transcribe_chunk(self, audio_chunk: np.ndarray) -> str:
@@ -129,9 +137,78 @@ class RealtimeTranscriber:
             print(f"Transcription error: {e}")
             return ""
     
+    def _diff_refined_text(self, refined_text: str) -> tuple[str, bool]:
+        """Return the portion of text that is new compared to the last refinement."""
+        if not refined_text:
+            return "", False
+        
+        if not self.last_refined_text:
+            self.last_refined_text = refined_text
+            return refined_text, False
+        
+        last_text = self.last_refined_text
+        common_prefix_length = 0
+        for c1, c2 in zip(last_text, refined_text):
+            if c1 != c2:
+                break
+            common_prefix_length += 1
+        
+        # Avoid cutting through a word when possible
+        if (
+            common_prefix_length
+            and common_prefix_length < len(refined_text)
+            and not refined_text[common_prefix_length - 1].isspace()
+        ):
+            last_space = refined_text.rfind(" ", 0, common_prefix_length)
+            if last_space != -1:
+                common_prefix_length = last_space + 1
+            else:
+                common_prefix_length = 0
+        
+        new_text = refined_text[common_prefix_length:].strip()
+        is_refinement = common_prefix_length < len(last_text)
+        self.last_refined_text = refined_text
+        return new_text, is_refinement
+    
+    def _print_live_line(self, timestamp: str, text: str) -> None:
+        """Show immediate transcription while waiting for refinement."""
+        line = f"[{timestamp}] (live) {text}"
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+        self._live_line_active = True
+        self._live_line_length = len(line)
+    
+    def _replace_live_line(self, timestamp: str, text: str, is_refinement: bool) -> None:
+        """Replace the live line with the refined result."""
+        if not text.strip():
+            self._clear_live_line()
+            return
+        
+        prefix = "Refined: " if is_refinement else ""
+        line = f"[{timestamp}] {prefix}{text}"
+        if self._live_line_active:
+            sys.stdout.write("\r" + " " * self._live_line_length + "\r")
+            sys.stdout.flush()
+        print(line, flush=True)
+        self._live_line_active = False
+        self._live_line_length = 0
+    
+    def _clear_live_line(self) -> None:
+        """Clear any live line when no refined text is produced."""
+        if not self._live_line_active:
+            return
+        sys.stdout.write("\r" + " " * self._live_line_length + "\r")
+        sys.stdout.flush()
+        self._live_line_active = False
+        self._live_line_length = 0
+    
     def process_audio(self):
         """Process audio chunks from the queue"""
         audio_buffer = np.array([], dtype=np.float32)
+        self.chunk_history.clear()
+        self.last_refined_text = ""
+        self._live_line_active = False
+        self._live_line_length = 0
         
         while self.is_recording or not self.audio_queue.empty():
             try:
@@ -147,11 +224,29 @@ class RealtimeTranscriber:
                     
                     # Check if chunk has enough audio content
                     if np.max(np.abs(chunk)) > 0.01:  # Minimum volume threshold
+                        chunk = chunk.astype(np.float32, copy=True)
                         timestamp = datetime.now().strftime("%H:%M:%S")
-                        text = self.transcribe_chunk(chunk)
+                        live_text = self.transcribe_chunk(chunk)
+                        if live_text:
+                            self._print_live_line(timestamp, live_text)
+                        else:
+                            self._clear_live_line()
+                        
+                        self.chunk_history.append(chunk)
+                        combined_audio = np.concatenate(list(self.chunk_history))
+                        text = self.transcribe_chunk(combined_audio)
                         
                         if text:
-                            print(f"[{timestamp}] {text}")
+                            new_text, is_refinement = self._diff_refined_text(text)
+                            if self._live_line_active:
+                                final_text = new_text if new_text else (live_text or "")
+                                self._replace_live_line(timestamp, final_text, is_refinement)
+                            elif new_text:
+                                prefix = "Refined: " if is_refinement else ""
+                                print(f"[{timestamp}] {prefix}{new_text}")
+                        else:
+                            if self._live_line_active:
+                                self._replace_live_line(timestamp, live_text or "", False)
                     
             except queue.Empty:
                 continue
@@ -213,6 +308,12 @@ def parse_args() -> argparse.Namespace:
         help="Audio sample rate in Hz (default: 16000)",
     )
     parser.add_argument(
+        "--refinement-chunks",
+        type=int,
+        default=3,
+        help="Number of recent audio chunks to use for refinement (default: 3)",
+    )
+    parser.add_argument(
         "--use-mic",
         action="store_true",
         help="Use microphone instead of system audio",
@@ -227,6 +328,7 @@ def main():
         device=args.device,
         chunk_duration=args.chunk_duration,
         sample_rate=args.sample_rate,
+        refinement_history=args.refinement_chunks,
     )
     
     use_system_audio = not args.use_mic
