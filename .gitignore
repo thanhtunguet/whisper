@@ -1,0 +1,7 @@
+.venv/
+*.mov
+*.mp4
+*.srt
+*.txt
+*.wav
+*.mp3
