@@ -5,3 +5,4 @@
 *.txt
 *.wav
 *.mp3
+!requirements.txt
