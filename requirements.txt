@@ -2,3 +2,6 @@ openai-whisper
 sounddevice
 numpy
 torch
+colorama
+scikit-learn
+librosa
