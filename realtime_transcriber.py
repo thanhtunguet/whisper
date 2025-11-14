@@ -12,6 +12,19 @@ import whisper
 import torch
 
 class RealtimeTranscriber:
+    # ANSI color codes for cycling through colors
+    COLORS = [
+        '\033[91m',  # Red
+        '\033[92m',  # Green
+        '\033[93m',  # Yellow
+        '\033[94m',  # Blue
+        '\033[95m',  # Magenta
+        '\033[96m',  # Cyan
+        '\033[97m',  # White
+        '\033[38;5;214m',  # Bright Orange
+    ]
+    RESET = '\033[0m'
+    
     def __init__(
         self,
         model_size: str = "base",
@@ -28,6 +41,7 @@ class RealtimeTranscriber:
         self.last_refined_text: str = ""
         self._live_line_active = False
         self._live_line_length = 0
+        self._color_index = 0
         
         # Auto-select device if not provided (prioritize MPS for M1/M2 Macs)
         if device is None:
@@ -137,6 +151,15 @@ class RealtimeTranscriber:
             print(f"Transcription error: {e}")
             return ""
     
+    def _get_next_color(self) -> str:
+        """Get the next color in the cycle."""
+        color = self.COLORS[self._color_index]
+        return color
+    
+    def _advance_color(self) -> None:
+        """Advance to the next color in the cycle."""
+        self._color_index = (self._color_index + 1) % len(self.COLORS)
+    
     def _diff_refined_text(self, refined_text: str) -> tuple[str, bool]:
         """Return the portion of text that is new compared to the last refinement."""
         if not refined_text:
@@ -172,11 +195,14 @@ class RealtimeTranscriber:
     
     def _print_live_line(self, timestamp: str, text: str) -> None:
         """Show immediate transcription while waiting for refinement."""
-        line = f"[{timestamp}] (live) {text}"
+        color = self._get_next_color()
+        line = f"{color}[{timestamp}] (live) {text}{self.RESET}"
+        # Store length without ANSI codes for proper clearing
+        line_plain = f"[{timestamp}] (live) {text}"
         sys.stdout.write("\r" + line)
         sys.stdout.flush()
         self._live_line_active = True
-        self._live_line_length = len(line)
+        self._live_line_length = len(line_plain)
     
     def _replace_live_line(self, timestamp: str, text: str, is_refinement: bool) -> None:
         """Replace the live line with the refined result."""
@@ -184,14 +210,16 @@ class RealtimeTranscriber:
             self._clear_live_line()
             return
         
+        color = self._get_next_color()
         prefix = "Refined: " if is_refinement else ""
-        line = f"[{timestamp}] {prefix}{text}"
+        line = f"{color}[{timestamp}] {prefix}{text}{self.RESET}"
         if self._live_line_active:
             sys.stdout.write("\r" + " " * self._live_line_length + "\r")
             sys.stdout.flush()
         print(line, flush=True)
         self._live_line_active = False
         self._live_line_length = 0
+        self._advance_color()
     
     def _clear_live_line(self) -> None:
         """Clear any live line when no refined text is produced."""
@@ -242,8 +270,10 @@ class RealtimeTranscriber:
                                 final_text = new_text if new_text else (live_text or "")
                                 self._replace_live_line(timestamp, final_text, is_refinement)
                             elif new_text:
+                                color = self._get_next_color()
                                 prefix = "Refined: " if is_refinement else ""
-                                print(f"[{timestamp}] {prefix}{new_text}")
+                                print(f"{color}[{timestamp}] {prefix}{new_text}{self.RESET}")
+                                self._advance_color()
                         else:
                             if self._live_line_active:
                                 self._replace_live_line(timestamp, live_text or "", False)

@@ -6,3 +6,5 @@
 *.wav
 *.mp3
 !requirements.txt
+.DS_Store
+
